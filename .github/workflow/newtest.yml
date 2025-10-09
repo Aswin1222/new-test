@@ -1,0 +1,15 @@
+name: polaris core api
+
+on:
+  push:
+    branches:
+      - feature/yaml_test
+
+jobs:
+  build-and-deploy:
+    name: build and deploy Hello github
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: print hello github in horizontal
+        run: echo "Hello github"
