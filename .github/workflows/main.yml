@@ -1,0 +1,234 @@
+name: administration-deployment 
+
+on:
+  push:
+    branches:
+      - dev2
+      - qa
+      - demo
+      - prod
+
+jobs:
+  # ──────────────── DEV2 ────────────────
+  build_and_deploy_dev2:
+    if: github.ref == 'refs/heads/dev2'
+    name: Build and Deploy 
+    runs-on: ubuntu-latest
+    env:
+      GH_CLIENT_ID: ${{ secrets.GH_CLIENT_ID }}
+      GH_PRIVATE_KEY: ${{ secrets.GH_PRIVATE_KEY }}
+      GH_INSTALLATION_ID: ${{ secrets.GH_INSTALLATION_ID }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: dev2
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pylint azure-storage-blob pyjwt cryptography requests
+      - name: Set TIMESTAMP
+        run: echo "TIMESTAMP=$(date +'%Y%m%d%H%M%S')" >> $GITHUB_ENV
+
+      - name: Run pylint and save report
+        run: |
+          if [ -d "usercreation" ] || [ -d "useradministration" ] || [ -d "infraDetails" ] || [ -d "utils" ]; then
+            pylint usercreation/ useradministration/ infraDetails/ utils/ \
+              --output-format=text > administration-${{ env.TIMESTAMP }}.txt || true
+          else
+            echo "No directories found for linting."
+          fi
+      - name: Upload Pylint Report to Dev Blob
+        run: |
+          if [ -f "administration-${{ env.TIMESTAMP }}.txt" ]; then
+            echo "Uploading file: administration-${{ env.TIMESTAMP }}.txt"
+            az storage blob upload \
+              --account-name ${{ secrets.AZURE_STORAGE_ACCOUNT }} \
+              --container-name pylint-reports \
+              --name dev/administration-${{ env.TIMESTAMP }}.txt \
+              --file administration-${{ env.TIMESTAMP }}.txt \
+              --auth-mode key
+          else
+            echo "No pylint report to upload."
+          fi
+        env:
+          AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+          AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
+
+      # GitHub App authentication
+      - name: Generate JWT Token
+        id: generate_jwt
+        run: |
+          python3 generate_lib_token.py > jwt_token.txt
+          echo "JWT_TOKEN=$(cat jwt_token.txt)" >> $GITHUB_ENV
+      - name: Get GitHub App Access Token
+        id: get_token
+        run: |
+          ACCESS_TOKEN=$(curl -s -X POST \
+            -H "Authorization: Bearer $JWT_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/app/installations/$GH_INSTALLATION_ID/access_tokens | jq -r .token)
+          echo "ACCESS_TOKEN=$ACCESS_TOKEN" >> $GITHUB_ENV
+      - name: Docker Login to Dev ACR
+        uses: azure/docker-login@v1
+        with:
+          login-server: polarisdev.azurecr.io
+          username: ${{ secrets.REGISTRY_USERNAME_DEV2 }}
+          password: ${{ secrets.REGISTRY_PASSWORD_DEV2 }}
+
+      - name: Determine Branch
+        id: determine_branch
+        run: echo "BRANCH=${GITHUB_REF##*/}" >> $GITHUB_OUTPUT
+
+      - name: Build and Push Dev Docker Image
+        run: |
+          BRANCH=${{ steps.determine_branch.outputs.BRANCH }}
+          DOCKER_BUILDKIT=1 docker build \
+            --secret id=gh_token,env=ACCESS_TOKEN \
+            --secret id=branch,src=<(echo $BRANCH) \
+            -t polarisdev.azurecr.io/sds-administration:${{ github.sha }} .
+          docker tag polarisdev.azurecr.io/sds-administration:${{ github.sha }} polarisdev.azurecr.io/sds-administration:latest
+          echo "Pushing Dev Docker image to ACR..."
+          docker push polarisdev.azurecr.io/sds-administration:latest
+  # ──────────────── QA / DEMO / PROD ────────────────
+  build_and_deploy_env:
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/qa' || github.ref == 'refs/heads/demo' || github.ref == 'refs/heads/prod')
+    runs-on: ubuntu-latest
+    env:
+      GH_CLIENT_ID: ${{ secrets.GH_CLIENT_ID }}
+      GH_PRIVATE_KEY: ${{ secrets.GH_PRIVATE_KEY }}
+      GH_INSTALLATION_ID: ${{ secrets.GH_INSTALLATION_ID }}
+      IMAGE_NAME_QA: sdsqapolaris.azurecr.io/sds-polaris-administration
+      IMAGE_NAME_DEMO: sdsdemopolaris.azurecr.io/sds-polaris-administration
+      IMAGE_NAME_PROD: sdspolarisprod.azurecr.io/sds-polaris-administration
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine Branch
+        id: determine_branch
+        run: |
+          echo "BRANCH=${GITHUB_REF##*/}" >> $GITHUB_OUTPUT
+      - name: Merge dev2 to qa
+        if: steps.determine_branch.outputs.BRANCH == 'qa'
+        uses: everlytic/branch-merge@1.1.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          source_ref: 'dev2'
+          target_branch: 'qa'
+
+      - name: Check if relevant config file was modified
+        id: check_config_changes
+        run: |
+          CONFIG_FILE="config/${{ steps.determine_branch.outputs.BRANCH }}.json"
+          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD)
+          if echo "$CHANGED_FILES" | grep -q "$CONFIG_FILE"; then
+            echo "modified=true" >> $GITHUB_OUTPUT
+          else
+            echo "modified=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Check config file existence
+        id: check_config
+        if: steps.check_config_changes.outputs.modified == 'true'
+        run: |
+          CONFIG_FILE="config/${{ steps.determine_branch.outputs.BRANCH }}.json"
+          if [ -f "$CONFIG_FILE" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Read version from config.json
+        id: get_version
+        if: steps.check_config.outputs.exists == 'true'
+        run: |
+          CONFIG_FILE="config/${{ steps.determine_branch.outputs.BRANCH }}.json"
+          VERSION=$(python -c "import json; print(json.load(open('$CONFIG_FILE'))['version'].strip())")
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+      - name: Check if tag exists
+        id: tag_check
+        if: steps.check_config.outputs.exists == 'true'
+        run: |
+          if git rev-parse "refs/tags/${{ env.VERSION }}" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Checkout code at tag if exists
+        if: steps.tag_check.outputs.exists == 'true'
+        run: |
+          git fetch --tags
+          git checkout tags/${{ env.VERSION }}
+      - name: Create tag if not exists
+        if: steps.tag_check.outputs.exists == 'false' && steps.check_config.outputs.exists == 'true'
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git tag ${{ env.VERSION }}
+          git push origin ${{ env.VERSION }}
+      # GitHub App authentication
+      - name: Generate JWT Token
+        id: generate_jwt
+        run: |
+          python3 generate_lib_token.py > jwt_token.txt
+          echo "JWT_TOKEN=$(cat jwt_token.txt)" >> $GITHUB_ENV
+      - name: Get GitHub App Access Token
+        id: get_token
+        run: |
+          ACCESS_TOKEN=$(curl -s -X POST \
+            -H "Authorization: Bearer $JWT_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/app/installations/$GH_INSTALLATION_ID/access_tokens | jq -r .token)
+          echo "ACCESS_TOKEN=$ACCESS_TOKEN" >> $GITHUB_ENV
+      - name: Set environment variables
+        id: set_env
+        if: steps.check_config.outputs.exists == 'true'
+        run: |
+          if [[ "${{ steps.determine_branch.outputs.BRANCH }}" == "qa" ]]; then
+            echo "REGISTRY=sdsqapolaris.azurecr.io" >> $GITHUB_OUTPUT
+            echo "IMAGE_NAME=${{ env.IMAGE_NAME_QA }}" >> $GITHUB_OUTPUT
+            echo "USERNAME=${{ secrets.REGISTRY_USERNAME_QA }}" >> $GITHUB_OUTPUT
+            echo "PASSWORD=${{ secrets.REGISTRY_PASSWORD_QA }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.determine_branch.outputs.BRANCH }}" == "demo" ]]; then
+            echo "REGISTRY=sdsdemopolaris.azurecr.io" >> $GITHUB_OUTPUT
+            echo "IMAGE_NAME=${{ env.IMAGE_NAME_DEMO }}" >> $GITHUB_OUTPUT
+            echo "USERNAME=${{ secrets.REGISTRY_USERNAME_DEMO }}" >> $GITHUB_OUTPUT
+            echo "PASSWORD=${{ secrets.REGISTRY_PASSWORD_DEMO }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.determine_branch.outputs.BRANCH }}" == "prod" ]]; then
+            echo "REGISTRY=sdspolarisprod.azurecr.io" >> $GITHUB_OUTPUT
+            echo "IMAGE_NAME=${{ env.IMAGE_NAME_PROD }}" >> $GITHUB_OUTPUT
+            echo "USERNAME=${{ secrets.REGISTRY_USERNAME_PROD }}" >> $GITHUB_OUTPUT
+            echo "PASSWORD=${{ secrets.REGISTRY_PASSWORD_PROD }}" >> $GITHUB_OUTPUT
+          fi
+      - name: Docker Login to ACR
+        if: steps.check_config.outputs.exists == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ steps.set_env.outputs.REGISTRY }}
+          username: ${{ steps.set_env.outputs.USERNAME }}
+          password: ${{ steps.set_env.outputs.PASSWORD }}
+
+      - name: Build and Push Docker Image (latest only)
+        if: steps.check_config.outputs.exists == 'true'
+        run: |
+          BRANCH=${{ steps.determine_branch.outputs.BRANCH }}
+          DOCKER_BUILDKIT=1 docker build \
+            --secret id=gh_token,env=ACCESS_TOKEN \
+            --secret id=branch,src=<(echo $BRANCH) \
+            -t ${{ steps.set_env.outputs.IMAGE_NAME }}:latest .
+          docker push ${{ steps.set_env.outputs.IMAGE_NAME }}:latest
